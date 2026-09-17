@@ -75,7 +75,7 @@ def _compute_masking_threshold(magnitude: torch.Tensor, freqs: torch.Tensor,
     for i in range(n_bands):
         spreading[i] = _spreading_function(band_centers[i], band_centers, True)
 
-    masked_energy = torch.matmul(band_energy, spreading.T)  # (C, n_bands)
+    masked_energy = torch.matmul(band_energy, spreading.T)
 
     threshold = torch.zeros(C, F, device=device)
     for b in range(n_bands):
@@ -83,18 +83,21 @@ def _compute_masking_threshold(magnitude: torch.Tensor, freqs: torch.Tensor,
         if mask.any():
             threshold[:, mask] = masked_energy[:, b:b + 1]
 
-    # Absolute threshold of hearing — clamp freqs to avoid inf at 0 Hz
-    safe_freqs = torch.clamp(freqs, min=1.0)
+    # ── ATH FIX ──────────────────────────────────────────
+    # Only compute ATH above 20 Hz. Below that, set a tiny
+    # floor instead of letting the formula explode.
+    safe_freqs = torch.clamp(freqs, min=20.0)
     ath_db = (3.64 * (safe_freqs / 1000) ** -0.8
               - 6.5 * torch.exp(-0.6 * (safe_freqs / 1000 - 3.3) ** 2)
               + 1e-3 * (safe_freqs / 1000) ** 4)
-    ath = 10.0 ** (ath_db / 20.0)  # dB → linear
+    # Clamp ATH to a sane range: 0–80 dB. The raw formula can
+    # exceed 100 dB at extreme frequencies; that is never useful.
+    ath_db = torch.clamp(ath_db, min=0.0, max=80.0)
+    ath = 10.0 ** (ath_db / 20.0)
     ath = ath.to(device)
+    # ─────────────────────────────────────────────────────
 
-    # Element-wise max: (C, F) vs (1, F) → (C, F)
     threshold = torch.maximum(threshold, ath.unsqueeze(0))
-
-    # Expand to match frames dimension
     return threshold.unsqueeze(-1).expand(-1, -1, frames)
 
 
@@ -768,8 +771,9 @@ class AudioMidSidePerturbation:
 
 class AudioPsychoacousticNoiseShaping:
     """
-    Adds dither shaped by psychoacoustic masking thresholds.
-    Noise rises in loud/masked regions and drops to the noise floor in silent regions.
+    Adds noise shaped by psychoacoustic masking thresholds,
+    scaled to a target SNR. Noise rises in loud/masked regions
+    and drops to the noise floor in silent regions.
     """
 
     @classmethod
@@ -779,12 +783,17 @@ class AudioPsychoacousticNoiseShaping:
                 "audio": ("AUDIO",),
                 "target_snr_db": ("FLOAT", {
                     "default": 40.0, "min": 20.0, "max": 80.0, "step": 1.0,
+                    "tooltip": "Target signal-to-noise ratio in dB. "
+                               "Higher = quieter noise. 40 is a good default."
                 }),
                 "masking_margin_db": ("FLOAT", {
                     "default": 6.0, "min": 0.0, "max": 20.0, "step": 0.5,
+                    "tooltip": "Safety margin below masking threshold (dB). "
+                               "Higher = more conservative noise."
                 }),
                 "noise_floor_db": ("FLOAT", {
                     "default": -90.0, "min": -120.0, "max": -60.0, "step": 1.0,
+                    "tooltip": "Absolute noise floor limit in dBFS."
                 }),
                 "seed": ("INT", {
                     "default": 0, "min": 0, "max": 2**31,
@@ -807,36 +816,54 @@ class AudioPsychoacousticNoiseShaping:
         n_fft = 2048
         hop = n_fft // 4
         freqs = torch.fft.rfftfreq(n_fft, d=1.0 / sr, device=wav.device)
-
         out = torch.empty_like(wav)
 
         for b in range(B):
             for c in range(C):
                 sig = wav[b, c]
-                S = _stft(sig.unsqueeze(0), n_fft, hop).squeeze(0)
+                S = _stft(sig.unsqueeze(0), n_fft, hop).squeeze(0)  # (F, frames)
                 mag = S.abs()
 
-                # Compute masking threshold
+                # ── 1. Masking threshold ──────────────────────
                 threshold = _compute_masking_threshold(
                     mag.unsqueeze(0), freqs, sr, n_fft)
                 threshold = threshold.squeeze(0)  # (F, frames)
 
-                # Target noise level
-                # FIX: Use `min` instead of `max`. The noise floor is the absolute 
-                # minimum (quietest) the noise can be. In loud/masked regions, 
-                # the noise is allowed to rise above the floor.
-                noise_target_db = torch.clamp(
-                    20 * torch.log10(threshold + 1e-10) - masking_margin_db,
-                    min=noise_floor_db
-                )
-                noise_target = 10.0 ** (noise_target_db / 20.0)
+                # ── 2. SNR-based noise ceiling (FIX: actually
+                #       use target_snr_db) ─────────────────────
+                # Global signal level for this channel
+                signal_rms = mag.mean() + 1e-10
+                # noise = signal / 10^(SNR/20)
+                snr_divisor = 10.0 ** (target_snr_db / 20.0)
+                noise_from_snr = signal_rms / snr_divisor  # scalar
 
-                # FIX: torch.randn_like does not accept `generator`.
-                # Generate real and imaginary parts explicitly for complex noise.
-                noise_real = torch.randn(S.shape, dtype=torch.float32, device=S.device, generator=gen)
-                noise_imag = torch.randn(S.shape, dtype=torch.float32, device=S.device, generator=gen)
+                # ── 3. Combine: noise must satisfy BOTH the
+                #       masking threshold AND the SNR target ──
+                noise_target = torch.minimum(threshold, noise_from_snr)
+
+                # Apply masking margin (back off from threshold)
+                margin_linear = 10.0 ** (-masking_margin_db / 20.0)
+                noise_target = noise_target * margin_linear
+
+                # ── 4. Clamp to noise floor ───────────────────
+                noise_floor_linear = 10.0 ** (noise_floor_db / 20.0)
+                noise_target = torch.clamp(noise_target, min=noise_floor_linear)
+
+                # ── 5. Hard cap: noise must never exceed 10 %
+                #       of the local signal magnitude ─────────
+                noise_target = torch.minimum(
+                    noise_target, mag * 0.1 + 1e-10)
+
+                # ── 6. Generate shaped complex noise ─────────
+                noise_real = torch.randn(
+                    S.shape, dtype=torch.float32,
+                    device=S.device, generator=gen)
+                noise_imag = torch.randn(
+                    S.shape, dtype=torch.float32,
+                    device=S.device, generator=gen)
                 noise_spec = (noise_real + 1j * noise_imag) * noise_target
 
+                # ── 7. Add to signal ─────────────────────────
                 S_out = S + noise_spec
                 sig_out = _istft(S_out.unsqueeze(0), n_fft, hop, T).squeeze(0)
                 out[b, c] = sig_out
