@@ -9,7 +9,7 @@ the ComfyUI AUDIO type: {"waveform": Tensor (B, C, T), "sample_rate": int}
 """
 
 import torch
-import torchaudio
+import numpy as np
 import math
 import os
 import subprocess
@@ -320,7 +320,18 @@ class AudioCodecReencode:
                 enc = os.path.join(tmp, f"enc.{self._ext(codec)}")
                 dec = os.path.join(tmp, "dec.wav")
 
-                torchaudio.save(src, w.cpu(), sr)
+                raw_audio = (
+                    w.detach().float().cpu().clamp(-1.0, 1.0).numpy()
+                    .T.astype(np.float32, copy=False).tobytes()
+                )
+                cmd_src = [
+                    "ffmpeg", "-y",
+                    "-f", "f32le", "-ar", str(sr), "-ac", str(C),
+                    "-i", "pipe:0", "-c:a", "pcm_s16le", src,
+                ]
+                subprocess.run(
+                    cmd_src, input=raw_audio, capture_output=True, check=True
+                )
 
                 # encode
                 cmd_enc = [
@@ -337,9 +348,18 @@ class AudioCodecReencode:
                 cmd_dec = ["ffmpeg", "-y", "-i", enc, dec]
                 subprocess.run(cmd_dec, capture_output=True, check=True)
 
-                w_dec, sr_dec = torchaudio.load(dec)
-                if sr_dec != sr:
-                    w_dec = torchaudio.functional.resample(w_dec, sr_dec, sr)
+                cmd_dec = [
+                    "ffmpeg", "-v", "error", "-i", dec,
+                    "-f", "f32le", "-acodec", "pcm_f32le",
+                    "-ar", str(sr), "-ac", str(C), "pipe:1",
+                ]
+                decoded = subprocess.run(
+                    cmd_dec, capture_output=True, check=True
+                )
+                decoded_np = np.frombuffer(decoded.stdout, dtype=np.float32)
+                if decoded_np.size % C:
+                    raise RuntimeError("decoded audio has an incomplete sample frame")
+                w_dec = torch.from_numpy(decoded_np.reshape(-1, C).T.copy())
                 # Keep ComfyUI's batch shape stable across codec padding/delay.
                 if w_dec.shape[0] != C:
                     raise RuntimeError(
