@@ -769,6 +769,7 @@ class AudioMidSidePerturbation:
 class AudioPsychoacousticNoiseShaping:
     """
     Adds dither shaped by psychoacoustic masking thresholds.
+    Noise rises in loud/masked regions and drops to the noise floor in silent regions.
     """
 
     @classmethod
@@ -821,14 +822,20 @@ class AudioPsychoacousticNoiseShaping:
                 threshold = threshold.squeeze(0)  # (F, frames)
 
                 # Target noise level
+                # FIX: Use `min` instead of `max`. The noise floor is the absolute 
+                # minimum (quietest) the noise can be. In loud/masked regions, 
+                # the noise is allowed to rise above the floor.
                 noise_target_db = torch.clamp(
                     20 * torch.log10(threshold + 1e-10) - masking_margin_db,
-                    max=noise_floor_db
+                    min=noise_floor_db
                 )
                 noise_target = 10.0 ** (noise_target_db / 20.0)
 
-                # Generate shaped noise in frequency domain
-                noise_spec = torch.randn_like(S, generator=gen) * noise_target
+                # FIX: torch.randn_like does not accept `generator`.
+                # Generate real and imaginary parts explicitly for complex noise.
+                noise_real = torch.randn(S.shape, dtype=torch.float32, device=S.device, generator=gen)
+                noise_imag = torch.randn(S.shape, dtype=torch.float32, device=S.device, generator=gen)
+                noise_spec = (noise_real + 1j * noise_imag) * noise_target
 
                 S_out = S + noise_spec
                 sig_out = _istft(S_out.unsqueeze(0), n_fft, hop, T).squeeze(0)
